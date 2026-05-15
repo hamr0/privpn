@@ -1,0 +1,836 @@
+#!/bin/bash
+# privpn — WireGuard VPN through your own VPS
+#
+# First time:
+#   privpn → 1 (VPS access) → 2 (Install WireGuard)
+#
+# After that:
+#   privpn → 3 (connect) / 4 (disconnect)
+#
+# Works without any dependencies beyond ssh and wg-quick.
+# Optional: save config/keys to pass (option 7).
+
+set -e
+
+# ── Colors ───────────────────────────────────────────
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+ok()   { echo -e "  ${GREEN}+${NC} $1"; }
+fail() { echo -e "  ${RED}x${NC} $1"; }
+info() { echo -e "  ${DIM}$1${NC}"; }
+warn() { echo -e "  ${YELLOW}!${NC} $1"; }
+
+# ── Config ───────────────────────────────────────────
+CONFIG_DIR="$HOME/.config/privpn"
+CONFIG_FILE="$CONFIG_DIR/config"
+WG_IFACE="privpn"
+WG_CONF="/etc/wireguard/${WG_IFACE}.conf"
+WG_PORT=51820
+VPN_SUBNET="10.100.0"
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    fi
+}
+
+save_config() {
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+VPS_HOST="$VPS_HOST"
+VPS_USER="$VPS_USER"
+EOF
+    chmod 600 "$CONFIG_FILE"
+}
+
+vps_ssh() {
+    load_config
+    if [[ -z "$VPS_HOST" || -z "$VPS_USER" ]]; then
+        fail "VPS not configured. Run option 1 first."
+        return 1
+    fi
+    ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$VPS_USER@$VPS_HOST" "$@"
+}
+
+# ── 1) VPS Access ───────────────────────────────────
+step_vps_access() {
+    echo ""
+    echo -e "  ${BOLD}VPS Access Setup${NC}"
+    info "Connect to your VPS and copy your SSH key."
+    info "You only need to do this once."
+    echo ""
+
+    load_config
+
+    # Prompt for host/user (show existing as default)
+    local default_host="${VPS_HOST:-}"
+    local default_user="${VPS_USER:-root}"
+
+    if [[ -n "$default_host" ]]; then
+        read -p "  VPS host [$default_host]: " input_host
+        VPS_HOST="${input_host:-$default_host}"
+    else
+        read -p "  VPS host (IP or domain): " VPS_HOST
+        if [[ -z "$VPS_HOST" ]]; then
+            fail "Host is required."
+            return 1
+        fi
+    fi
+
+    read -p "  VPS user [$default_user]: " input_user
+    VPS_USER="${input_user:-$default_user}"
+
+    echo ""
+
+    # Check for existing SSH key
+    if [[ ! -f ~/.ssh/id_ed25519.pub && ! -f ~/.ssh/id_rsa.pub ]]; then
+        info "No SSH key found. Generating one..."
+        ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+        ok "Key generated: ~/.ssh/id_ed25519"
+        echo ""
+    fi
+
+    # Test if key auth already works
+    if ssh -o PasswordAuthentication=no -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$VPS_USER@$VPS_HOST" "echo ok" &>/dev/null; then
+        ok "SSH key already works for $VPS_USER@$VPS_HOST"
+        save_config
+        ok "Config saved: $CONFIG_FILE"
+        return
+    fi
+
+    # Copy SSH key (will prompt for password)
+    info "Copying SSH key to $VPS_USER@$VPS_HOST..."
+    info "Enter your VPS password when prompted (last time you'll need it)."
+    echo ""
+    ssh-copy-id -o StrictHostKeyChecking=accept-new "$VPS_USER@$VPS_HOST"
+
+    # Verify it works
+    echo ""
+    if ssh -o PasswordAuthentication=no -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" "echo ok" &>/dev/null; then
+        ok "SSH key login works!"
+        save_config
+        ok "Config saved: $CONFIG_FILE"
+    else
+        fail "Key login failed. Check your key and try again."
+        return 1
+    fi
+}
+
+# ── 2) Install WireGuard ────────────────────────────
+step_wireguard() {
+    load_config
+    echo ""
+    echo -e "  ${BOLD}Install WireGuard${NC}"
+    info "Installs WireGuard on your VPS and creates peer configs."
+    info "All keys are generated on the server."
+    echo ""
+
+    if [[ -z "$VPS_HOST" ]]; then
+        fail "VPS not configured. Run option 1 first."
+        return 1
+    fi
+
+    echo -e "  Checking VPS ($VPS_HOST)..."
+
+    # Check if WireGuard already running
+    if vps_ssh "wg show wg0 2>/dev/null" 2>/dev/null | grep -q "interface"; then
+        ok "WireGuard already running on VPS."
+        echo ""
+
+        # Show existing peers
+        echo -e "  ${BOLD}Current peers:${NC}"
+        vps_ssh "sudo grep '^# ' /etc/wireguard/wg0.conf 2>/dev/null" 2>/dev/null | sed 's/^# /    /'
+        echo ""
+
+        echo -e "  ${BOLD}1)${NC} Add new peer"
+        echo -e "  ${BOLD}2)${NC} Show peer config / QR"
+        echo -e "  ${BOLD}3)${NC} Reinstall (regenerate all keys)"
+        echo -e "  ${BOLD}0)${NC} Cancel"
+        echo ""
+        read -p "  Choose: " wg_action
+
+        case $wg_action in
+            1) _wg_add_peer ;;
+            2) _wg_show_peer ;;
+            3) _wg_install ;;
+            0|*) return ;;
+        esac
+        return
+    fi
+
+    _wg_install
+}
+
+_wg_install() {
+    echo ""
+    echo -e "  ${BOLD}Installing WireGuard on VPS...${NC}"
+    echo ""
+
+    # Detect package manager and install
+    info "Installing packages (this may take a minute)..."
+    vps_ssh bash -s <<'DETECT'
+if command -v dnf &>/dev/null; then
+    echo "  Installing repos..."
+    dnf install -y epel-release elrepo-release 2>&1 | grep -E "^(Installing|Complete)" || true
+    echo "  Installing WireGuard..."
+    dnf install -y wireguard-tools kmod-wireguard qrencode 2>&1 | grep -E "^(Installing|Complete|Already)" || true
+    modprobe wireguard 2>/dev/null || true
+elif command -v apt-get &>/dev/null; then
+    echo "  Updating package list..."
+    apt-get update >/dev/null 2>&1
+    echo "  Installing WireGuard..."
+    apt-get install -y wireguard qrencode 2>&1 | grep -E "^(Setting up|is already)" || true
+else
+    echo "UNSUPPORTED_PKG_MANAGER"
+    exit 1
+fi
+echo "INSTALL_OK"
+DETECT
+
+    ok "WireGuard installed."
+
+    echo ""
+    echo -e "  ${YELLOW}ADD PEERS${NC}"
+    echo -e "  How many devices do you want to connect?"
+    echo -e "  (phone, laptop, partner's phone, etc.)"
+    read -p "  Number of peers [1]: " peer_count
+    peer_count="${peer_count:-1}"
+
+    # Collect peer info locally first
+    local peer_names=()
+    local peer_types=()
+    for i in $(seq 1 "$peer_count"); do
+        echo ""
+        echo -e "  ${BOLD}-- Peer $i of $peer_count --${NC}"
+        read -p "  Name for this device (e.g. phone, laptop): " pname
+        pname="${pname:-peer$i}"
+        echo ""
+        echo -e "  Device type for '${BOLD}$pname${NC}'?"
+        echo -e "  ${BOLD}1)${NC} Phone (iPhone/Android)"
+        echo -e "  ${BOLD}2)${NC} Laptop/Desktop (Linux)"
+        echo -e "  ${BOLD}3)${NC} Laptop/Desktop (Mac)"
+        read -p "  Type [1-3]: " ptype
+        peer_names+=("$pname")
+        peer_types+=("${ptype:-1}")
+    done
+
+    # Build peer names as a space-separated string for the remote script
+    local names_str="${peer_names[*]}"
+
+    # Run the full setup on VPS — single clean heredoc, no string concatenation
+    local output
+    output=$(vps_ssh bash -s -- "$VPS_HOST" "$WG_PORT" "$VPN_SUBNET" "$names_str" <<'REMOTE'
+set -e
+ENDPOINT="$1"
+WG_PORT="$2"
+WG_SUBNET="$3"
+shift 3
+PEER_NAMES=($@)
+
+WG_DIR="/etc/wireguard"
+mkdir -p "$WG_DIR"
+
+# Stop existing WireGuard
+systemctl stop wg-quick@wg0 2>/dev/null || true
+
+# Clean old configs
+rm -f "$WG_DIR"/*.conf "$WG_DIR"/*.key
+
+# Generate server keys
+SERVER_PRIVATE=$(wg genkey)
+SERVER_PUBLIC=$(echo "$SERVER_PRIVATE" | wg pubkey)
+
+# Detect network interface
+IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+
+# Enable IP forwarding
+echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-wireguard.conf
+sysctl -p /etc/sysctl.d/99-wireguard.conf >/dev/null
+
+# Open firewall
+if command -v firewall-cmd &>/dev/null; then
+    firewall-cmd --permanent --add-port=${WG_PORT}/udp 2>/dev/null || true
+    firewall-cmd --reload 2>/dev/null || true
+elif command -v ufw &>/dev/null; then
+    ufw allow ${WG_PORT}/udp 2>/dev/null || true
+fi
+
+# Write server config header
+cat > "$WG_DIR/wg0.conf" <<WGEOF
+[Interface]
+Address = ${WG_SUBNET}.1/24
+ListenPort = ${WG_PORT}
+PrivateKey = ${SERVER_PRIVATE}
+PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o ${IFACE} -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o ${IFACE} -j MASQUERADE
+WGEOF
+
+# Generate each peer
+IDX=2
+for PNAME in "${PEER_NAMES[@]}"; do
+    PEER_PRIVATE=$(wg genkey)
+    PEER_PUBLIC=$(echo "$PEER_PRIVATE" | wg pubkey)
+    PEER_PSK=$(wg genpsk)
+    PEER_IP="${WG_SUBNET}.${IDX}"
+
+    # Append peer to server config
+    cat >> "$WG_DIR/wg0.conf" <<PEEREOF
+
+[Peer]
+# ${PNAME}
+PublicKey = ${PEER_PUBLIC}
+PresharedKey = ${PEER_PSK}
+AllowedIPs = ${PEER_IP}/32
+PEEREOF
+
+    # Write peer client config
+    cat > "$WG_DIR/${PNAME}.conf" <<CLIENTEOF
+[Interface]
+PrivateKey = ${PEER_PRIVATE}
+Address = ${PEER_IP}/24
+DNS = 1.1.1.1, 8.8.8.8
+
+[Peer]
+PublicKey = ${SERVER_PUBLIC}
+PresharedKey = ${PEER_PSK}
+Endpoint = ${ENDPOINT}:${WG_PORT}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+CLIENTEOF
+    chmod 600 "$WG_DIR/${PNAME}.conf"
+
+    # Output peer config with markers for parsing
+    echo "PEER_CONF_${PNAME}"
+    cat "$WG_DIR/${PNAME}.conf"
+    echo "END_PEER_CONF_${PNAME}"
+
+    IDX=$((IDX + 1))
+done
+
+chmod 600 "$WG_DIR/wg0.conf"
+systemctl enable wg-quick@wg0 2>/dev/null || true
+systemctl restart wg-quick@wg0
+echo "WG_SETUP_COMPLETE"
+REMOTE
+)
+
+    if ! echo "$output" | grep -q "WG_SETUP_COMPLETE"; then
+        fail "WireGuard setup failed on VPS."
+        echo "$output"
+        return 1
+    fi
+
+    ok "WireGuard running on VPS."
+    echo ""
+
+    # Show per-peer instructions
+    for i in $(seq 1 "$peer_count"); do
+        local idx=$((i - 1))
+        local pname="${peer_names[$idx]}"
+        local ptype="${peer_types[$idx]}"
+
+        # Extract peer config from output
+        local peer_conf
+        peer_conf=$(echo "$output" | sed -n "/^PEER_CONF_${pname}$/,/^END_PEER_CONF_${pname}$/p" | sed '1d;$d')
+
+        _wg_show_instructions "$pname" "$peer_conf" "$ptype"
+
+        if (( i < peer_count )); then
+            echo ""
+            read -p "  Press Enter for next peer..." -r
+        fi
+    done
+
+    echo ""
+    ok "Setup complete."
+    echo -e "  Connect: ${BOLD}privpn connect${NC}"
+}
+
+_wg_add_peer() {
+    echo ""
+    local existing_peers
+    existing_peers=$(vps_ssh "sudo grep -c '^\[Peer\]' /etc/wireguard/wg0.conf 2>/dev/null" 2>/dev/null || echo "0")
+
+    read -p "  How many new peers to add [1]: " peer_count
+    peer_count="${peer_count:-1}"
+
+    local peer_names=()
+    local peer_types=()
+    for i in $(seq 1 "$peer_count"); do
+        local peer_num=$((existing_peers + i))
+        local peer_ip="${VPN_SUBNET}.$((peer_num + 1))"
+        echo ""
+        echo -e "  ${BOLD}-- New peer (IP: $peer_ip) --${NC}"
+        read -p "  Name: " pname
+        pname="${pname:-peer${peer_num}}"
+        echo ""
+        echo -e "  Device type for '${BOLD}$pname${NC}'?"
+        echo -e "  ${BOLD}1)${NC} Phone   ${BOLD}2)${NC} Linux   ${BOLD}3)${NC} Mac"
+        read -p "  Type [1-3]: " ptype
+        peer_names+=("$pname")
+        peer_types+=("${ptype:-1}")
+    done
+
+    # Add all peers in one SSH call
+    local names_str="${peer_names[*]}"
+    local output
+    output=$(vps_ssh bash -s -- "$VPS_HOST" "$WG_PORT" "$VPN_SUBNET" "$existing_peers" "$names_str" <<'ADDPEER'
+set -e
+ENDPOINT="$1"
+WG_PORT="$2"
+WG_SUBNET="$3"
+EXISTING="$4"
+shift 4
+PEER_NAMES=($@)
+
+WG_DIR="/etc/wireguard"
+SERVER_PUBLIC=$(grep "PrivateKey" "$WG_DIR/wg0.conf" | awk '{print $3}' | wg pubkey)
+
+IDX=$((EXISTING + 2))
+for PNAME in "${PEER_NAMES[@]}"; do
+    PEER_PRIVATE=$(wg genkey)
+    PEER_PUBLIC=$(echo "$PEER_PRIVATE" | wg pubkey)
+    PEER_PSK=$(wg genpsk)
+    PEER_IP="${WG_SUBNET}.${IDX}"
+
+    cat >> "$WG_DIR/wg0.conf" <<PEEREOF
+
+[Peer]
+# ${PNAME}
+PublicKey = ${PEER_PUBLIC}
+PresharedKey = ${PEER_PSK}
+AllowedIPs = ${PEER_IP}/32
+PEEREOF
+
+    cat > "$WG_DIR/${PNAME}.conf" <<CLIENTEOF
+[Interface]
+PrivateKey = ${PEER_PRIVATE}
+Address = ${PEER_IP}/24
+DNS = 1.1.1.1, 8.8.8.8
+
+[Peer]
+PublicKey = ${SERVER_PUBLIC}
+PresharedKey = ${PEER_PSK}
+Endpoint = ${ENDPOINT}:${WG_PORT}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+CLIENTEOF
+    chmod 600 "$WG_DIR/${PNAME}.conf"
+
+    echo "PEER_CONF_${PNAME}"
+    cat "$WG_DIR/${PNAME}.conf"
+    echo "END_PEER_CONF_${PNAME}"
+
+    IDX=$((IDX + 1))
+done
+
+systemctl restart wg-quick@wg0
+echo "ADD_PEER_COMPLETE"
+ADDPEER
+)
+
+    if ! echo "$output" | grep -q "ADD_PEER_COMPLETE"; then
+        fail "Failed to add peers."
+        echo "$output"
+        return 1
+    fi
+
+    for i in $(seq 1 "$peer_count"); do
+        local idx=$((i - 1))
+        local pname="${peer_names[$idx]}"
+        local ptype="${peer_types[$idx]}"
+        local peer_num=$((existing_peers + i))
+        local peer_ip="${VPN_SUBNET}.$((peer_num + 1))"
+
+        local peer_conf
+        peer_conf=$(echo "$output" | sed -n "/^PEER_CONF_${pname}$/,/^END_PEER_CONF_${pname}$/p" | sed '1d;$d')
+
+        ok "Peer '${pname}' added (IP: ${peer_ip})"
+        _wg_show_instructions "$pname" "$peer_conf" "$ptype"
+    done
+
+    ok "WireGuard reloaded."
+}
+
+_wg_show_peer() {
+    echo ""
+    local conf_list
+    conf_list=$(vps_ssh "sudo find /etc/wireguard -name '*.conf' ! -name 'wg0.conf' -printf '%f\n' 2>/dev/null" 2>/dev/null)
+
+    if [[ -z "$conf_list" ]]; then
+        fail "No peer configs found on VPS."
+        return
+    fi
+
+    echo -e "  ${BOLD}Available configs:${NC}"
+    local idx=1
+    declare -a conf_arr
+    while IFS= read -r f; do
+        local name="${f%.conf}"
+        echo -e "    ${BOLD}$idx)${NC} $name"
+        conf_arr[$idx]="$name"
+        idx=$((idx + 1))
+    done <<< "$conf_list"
+
+    echo ""
+    read -p "  Which peer? " peer_choice
+    local chosen="${conf_arr[$peer_choice]}"
+
+    if [[ -z "$chosen" ]]; then
+        fail "Invalid choice."
+        return
+    fi
+
+    echo ""
+    echo -e "  ${BOLD}Config for $chosen:${NC}"
+    echo ""
+    local peer_conf
+    peer_conf=$(vps_ssh "sudo cat /etc/wireguard/${chosen}.conf" 2>/dev/null)
+    echo "$peer_conf"
+    echo ""
+
+    echo -e "  ${BOLD}QR code (scan with WireGuard app):${NC}"
+    echo ""
+    vps_ssh "sudo cat /etc/wireguard/${chosen}.conf | qrencode -t UTF8" 2>/dev/null
+}
+
+_wg_show_instructions() {
+    local peer_name="$1" peer_conf="$2" device_type="$3"
+
+    case $device_type in
+        1)  # Phone
+            echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "  ${YELLOW}SETUP: $peer_name (phone)${NC}"
+            echo ""
+            echo -e "  1. Install ${BOLD}WireGuard${NC} app:"
+            echo -e "     iPhone: App Store > search 'WireGuard'"
+            echo -e "     Android: Play Store > search 'WireGuard'"
+            echo -e "  2. Open the app > tap ${BOLD}+${NC} > ${BOLD}Scan from QR code${NC}"
+            echo -e "  3. Scan this QR code:"
+            echo ""
+            echo "$peer_conf" | qrencode -t UTF8
+            echo ""
+            echo -e "  4. Give it a name (e.g. '${peer_name}')"
+            echo -e "  5. Toggle the switch to connect"
+            echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            ;;
+        2)  # Linux
+            echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "  ${YELLOW}SETUP: $peer_name (Linux)${NC}"
+            echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo ""
+            echo -e "  1. Install WireGuard (if not already):"
+            echo -e "     ${BOLD}sudo dnf install wireguard-tools${NC}   (Fedora/RHEL)"
+            echo -e "     ${BOLD}sudo apt install wireguard${NC}         (Debian/Ubuntu)"
+            echo ""
+            echo -e "  2. Connect:"
+            echo -e "     ${BOLD}privpn connect${NC}"
+            echo ""
+            echo -e "     Config is fetched from the VPS automatically."
+            echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+            # Save peer name so connect knows which config to fetch
+            mkdir -p "$CONFIG_DIR"
+            echo "$peer_name" > "$CONFIG_DIR/peer_name"
+            ;;
+        3)  # Mac
+            echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            echo -e "  ${YELLOW}SETUP: $peer_name (Mac)${NC}"
+            echo ""
+            echo -e "  1. Install WireGuard:"
+            echo -e "     ${BOLD}brew install wireguard-tools${NC}  (Homebrew)"
+            echo -e "     Or ${BOLD}Mac App Store${NC} > search 'WireGuard'"
+            echo ""
+            echo -e "  2. Save this config to a file (e.g. ~/Downloads/${peer_name}.conf):"
+            echo -e "  ${DIM}───────────────────────────────────────${NC}"
+            echo "$peer_conf"
+            echo -e "  ${DIM}───────────────────────────────────────${NC}"
+            echo ""
+            echo -e "  3. CLI: ${BOLD}sudo wg-quick up ~/Downloads/${peer_name}.conf${NC}"
+            echo -e "     GUI: WireGuard app > ${BOLD}Import Tunnel(s) from File${NC}"
+            echo ""
+            echo -e "  Disconnect: ${BOLD}sudo wg-quick down ${peer_name}${NC} or toggle off in app"
+            echo ""
+            echo -e "  Or scan QR with phone and AirDrop:"
+            echo ""
+            echo "$peer_conf" | qrencode -t UTF8
+            echo -e "  ${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+            ;;
+        *)
+            echo "$peer_conf" | qrencode -t UTF8
+            echo -e "  Config saved on VPS: /etc/wireguard/${peer_name}.conf"
+            ;;
+    esac
+}
+
+# ── 3) Connect ──────────────────────────────────────
+vpn_connect() {
+    if ! command -v wg-quick &>/dev/null; then
+        fail "WireGuard not installed. Run: sudo dnf install wireguard-tools"
+        return 1
+    fi
+
+    if sudo wg show "$WG_IFACE" &>/dev/null; then
+        ok "Already connected."
+        vpn_status
+        return
+    fi
+
+    load_config
+    if [[ -z "$VPS_HOST" ]]; then
+        fail "VPS not configured. Run option 1 first."
+        return 1
+    fi
+
+    # Fetch config from VPS — find the right peer config
+    local saved_peer=""
+    [[ -f "$CONFIG_DIR/peer_name" ]] && saved_peer=$(cat "$CONFIG_DIR/peer_name")
+
+    local peer_conf=""
+    if [[ -n "$saved_peer" ]]; then
+        peer_conf=$(vps_ssh "sudo cat /etc/wireguard/${saved_peer}.conf 2>/dev/null" 2>/dev/null)
+    fi
+
+    if [[ -z "$peer_conf" ]] || ! echo "$peer_conf" | grep -q "\[Interface\]"; then
+        local conf_list
+        conf_list=$(vps_ssh "sudo find /etc/wireguard -name '*.conf' ! -name 'wg0.conf' -printf '%f\n' 2>/dev/null" 2>/dev/null)
+
+        if [[ -z "$conf_list" ]]; then
+            fail "No peer configs found on VPS. Run option 2 first."
+            return 1
+        fi
+
+        local count=$(echo "$conf_list" | wc -l)
+        if [[ "$count" -eq 1 ]]; then
+            saved_peer="${conf_list%.conf}"
+        else
+            echo -e "  ${BOLD}Which config to use?${NC}"
+            local idx=1
+            declare -a conf_arr
+            while IFS= read -r f; do
+                local name="${f%.conf}"
+                echo -e "    ${BOLD}$idx)${NC} $name"
+                conf_arr[$idx]="$name"
+                idx=$((idx + 1))
+            done <<< "$conf_list"
+            echo ""
+            read -p "  Choose: " peer_choice
+            saved_peer="${conf_arr[$peer_choice]}"
+        fi
+
+        peer_conf=$(vps_ssh "sudo cat /etc/wireguard/${saved_peer}.conf 2>/dev/null" 2>/dev/null)
+        if [[ -z "$peer_conf" ]] || ! echo "$peer_conf" | grep -q "\[Interface\]"; then
+            fail "Could not read config for '${saved_peer}'."
+            return 1
+        fi
+
+        echo "$saved_peer" > "$CONFIG_DIR/peer_name"
+    fi
+
+    # Save config locally and connect
+    sudo mkdir -p /etc/wireguard
+    echo "$peer_conf" | sudo tee "$WG_CONF" > /dev/null
+    sudo chmod 600 "$WG_CONF"
+
+    sudo sysctl -qw net.ipv6.conf.all.disable_ipv6=0
+    sudo wg-quick up "$WG_IFACE"
+    sudo sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+
+    echo ""
+    ok "Connected."
+    local ip=$(curl -4 -s --max-time 5 ifconfig.me || echo "unknown")
+    echo -e "  Public IP: ${BOLD}$ip${NC}"
+}
+
+# ── 4) Disconnect ───────────────────────────────────
+vpn_disconnect() {
+    if ! sudo wg show "$WG_IFACE" &>/dev/null; then
+        info "Not running."
+        return
+    fi
+    sudo wg-quick down "$WG_IFACE" 2>/dev/null || true
+    sudo sysctl -qw net.ipv6.conf.all.disable_ipv6=0
+    echo -e "  ${YELLOW}Disconnected.${NC}"
+}
+
+# ── 5) Status ───────────────────────────────────────
+vpn_status() {
+    if sudo wg show "$WG_IFACE" &>/dev/null; then
+        echo -e "  ${GREEN}VPN: connected${NC}"
+        echo ""
+        sudo wg show "$WG_IFACE" | while IFS= read -r line; do
+            echo "  $line"
+        done
+        echo ""
+        local ip=$(curl -4 -s --max-time 5 ifconfig.me || echo "unknown")
+        echo -e "  Public IP: ${BOLD}$ip${NC}"
+    else
+        echo -e "  ${RED}VPN: disconnected${NC}"
+    fi
+}
+
+# ── 6) Disable password login ──────────────────────
+step_disable_password() {
+    load_config
+    echo ""
+    warn "This disables password login on your VPS."
+    warn "If you lose your SSH key, you may be locked out."
+    warn "Make sure you have a backup (option 7) or VPS console access."
+    echo ""
+    read -p "  Continue? [y/N] " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    # Verify key auth works first
+    if ! ssh -o PasswordAuthentication=no -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" "echo ok" &>/dev/null; then
+        fail "SSH key login doesn't work. Set up key auth first (option 1)."
+        return 1
+    fi
+
+    vps_ssh "sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && sudo systemctl restart sshd"
+    ok "Password login disabled. Key-only from now on."
+}
+
+# ── 7) Save to pass ────────────────────────────────
+step_save_to_pass() {
+    if ! command -v pass &>/dev/null; then
+        fail "pass is not installed."
+        info "Install: sudo dnf install pass"
+        return 1
+    fi
+
+    load_config
+    echo ""
+    echo -e "  ${BOLD}Save to pass${NC}"
+    info "Saves everything to pass — VPS config, SSH key, WireGuard configs."
+    info "Overwrites existing entries."
+    echo ""
+
+    # VPS config
+    if [[ -n "$VPS_HOST" ]]; then
+        echo "$VPS_HOST" | pass insert -e -f privpn/server/host 2>/dev/null && ok "privpn/server/host"
+        echo "$VPS_USER" | pass insert -e -f privpn/server/user 2>/dev/null && ok "privpn/server/user"
+    else
+        warn "No VPS config found. Run option 1 first."
+    fi
+
+    # SSH key
+    local key_file=""
+    if [[ -f ~/.ssh/id_ed25519 ]]; then
+        key_file=~/.ssh/id_ed25519
+    elif [[ -f ~/.ssh/id_rsa ]]; then
+        key_file=~/.ssh/id_rsa
+    fi
+
+    if [[ -n "$key_file" ]]; then
+        cat "$key_file" | pass insert -m -f privpn/ssh/private_key 2>/dev/null && ok "privpn/ssh/private_key"
+        cat "${key_file}.pub" | pass insert -m -f privpn/ssh/public_key 2>/dev/null && ok "privpn/ssh/public_key"
+    else
+        warn "No SSH key found."
+    fi
+
+    # Local WireGuard config (laptop)
+    if sudo test -f "$WG_CONF"; then
+        sudo cat "$WG_CONF" | pass insert -m -f privpn/wireguard/laptop_conf 2>/dev/null && ok "privpn/wireguard/laptop_conf"
+    fi
+
+    # Peer name
+    if [[ -f "$CONFIG_DIR/peer_name" ]]; then
+        cat "$CONFIG_DIR/peer_name" | pass insert -e -f privpn/wireguard/peer_name 2>/dev/null && ok "privpn/wireguard/peer_name"
+    fi
+
+    # Fetch all peer configs and server config from VPS
+    if [[ -n "$VPS_HOST" ]]; then
+        echo ""
+        info "Fetching configs from VPS..."
+
+        # Server wg0.conf
+        local server_conf
+        server_conf=$(vps_ssh "sudo cat /etc/wireguard/wg0.conf 2>/dev/null" 2>/dev/null)
+        if [[ -n "$server_conf" ]]; then
+            echo "$server_conf" | pass insert -m -f privpn/wireguard/server_conf 2>/dev/null && ok "privpn/wireguard/server_conf"
+        fi
+
+        # All peer configs
+        local conf_list
+        conf_list=$(vps_ssh "sudo find /etc/wireguard -name '*.conf' ! -name 'wg0.conf' -printf '%f\n' 2>/dev/null" 2>/dev/null)
+        if [[ -n "$conf_list" ]]; then
+            while IFS= read -r f; do
+                local name="${f%.conf}"
+                local peer_conf
+                peer_conf=$(vps_ssh "sudo cat /etc/wireguard/${f} 2>/dev/null" 2>/dev/null)
+                if [[ -n "$peer_conf" ]]; then
+                    echo "$peer_conf" | pass insert -m -f "privpn/wireguard/peers/${name}" 2>/dev/null && ok "privpn/wireguard/peers/${name}"
+                fi
+            done <<< "$conf_list"
+        fi
+    fi
+
+    echo ""
+    ok "All saved to pass."
+    echo ""
+    info "pass show privpn/                        # list everything"
+    info "pass show privpn/ssh/private_key          # restore SSH key"
+    info "pass show privpn/wireguard/laptop_conf    # restore laptop config"
+    info "pass show privpn/wireguard/server_conf    # restore server config"
+}
+
+# ── Menu ────────────────────────────────────────────
+show_menu() {
+    echo ""
+    echo -e "${BOLD}privpn — WireGuard VPN${NC}"
+    echo ""
+    if sudo wg show "$WG_IFACE" &>/dev/null; then
+        echo -e "  ${GREEN}connected${NC}"
+    else
+        echo -e "  ${DIM}disconnected${NC}"
+    fi
+    echo ""
+    echo -e "  ${YELLOW}-- Setup (once) --${NC}"
+    echo -e "  ${BOLD}1)${NC} VPS access             ${DIM}<- host, SSH key${NC}"
+    echo -e "  ${BOLD}2)${NC} Install WireGuard      ${DIM}<- install / peers / QR${NC}"
+    echo ""
+    echo -e "  ${DIM}-- VPN --${NC}"
+    echo -e "  ${BOLD}3)${NC} Connect"
+    echo -e "  ${BOLD}4)${NC} Disconnect"
+    echo -e "  ${BOLD}5)${NC} Status"
+    echo ""
+    echo -e "  ${DIM}-- Optional --${NC}"
+    echo -e "  ${BOLD}6)${NC} Disable password login"
+    echo -e "  ${BOLD}7)${NC} Save to pass"
+    echo -e "  ${BOLD}0)${NC} Exit"
+    echo ""
+    read -p "  Choose: " choice
+    case $choice in
+        1) step_vps_access ;;
+        2) step_wireguard ;;
+        3) vpn_connect ;;
+        4) vpn_disconnect ;;
+        5) vpn_status ;;
+        6) step_disable_password ;;
+        7) step_save_to_pass ;;
+        0|q) exit 0 ;;
+        *) echo -e "  ${RED}Invalid choice.${NC}" ;;
+    esac
+}
+
+# ── CLI ─────────────────────────────────────────────
+case "${1:-}" in
+    setup)              step_vps_access ;;
+    wireguard|wg)       step_wireguard ;;
+    connect|start|up)   vpn_connect ;;
+    disconnect|stop|down) vpn_disconnect ;;
+    status)             vpn_status ;;
+    disable-password)   step_disable_password ;;
+    save-to-pass)       step_save_to_pass ;;
+    -h|--help|help)     echo "Usage: privpn [setup|wg|connect|disconnect|status|disable-password|save-to-pass]" ;;
+    "")                 show_menu ;;
+    *)                  echo "Usage: privpn [setup|wg|connect|disconnect|status|disable-password|save-to-pass]" ;;
+esac

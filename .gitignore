@@ -1,0 +1,8 @@
+*.key
+*.conf
+*.png
+
+# Local agent state — not part of the product
+.claude/
+.barebrowse/
+CLAUDE.md

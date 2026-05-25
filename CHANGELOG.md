@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-05-25 — v0.3.0: userspace fallback, remove-peer, Docker on the roadmap
+
+- Backend detection on install: probes the WireGuard kernel module, falls back to
+  userspace `wireguard-go` when it can't load, and fails loudly when neither works
+  (so OpenVZ-style VPSes report clearly instead of dying mid-setup)
+- Added **remove a peer**: drops the peer's `[Peer]` block from `wg0.conf`, deletes
+  its client config, reloads WireGuard, and forgets it locally if `connect` used it
+- Menu reworked: Add / Remove / Show QR / Reinstall
+- Added `PRD.md` documenting principles, current state, and the planned optional
+  Docker deployment mode
+- README now credits prior art ([hwdsl2/wireguard-install](https://github.com/hwdsl2/wireguard-install),
+  [hwdsl2/docker-wireguard](https://github.com/hwdsl2/docker-wireguard)) instead of
+  reinventing the server-side installers
+- Ideas borrowed: userspace fallback and peer add/remove from the hwdsl2 projects
+
 ## 2026-04-06 — Save to pass: full backup of all configs and keys
 
 - Save to pass now stores everything: VPS host/user, SSH keys, all WireGuard configs

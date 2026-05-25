@@ -8,7 +8,7 @@
 ```
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.1-2a4f8c" alt="version 0.2.1">
+  <img src="https://img.shields.io/badge/version-0.3.0-2a4f8c" alt="version 0.3.0">
   <img src="https://img.shields.io/badge/license-Apache%202.0-2a4f8c" alt="license: Apache 2.0">
 </p>
 
@@ -27,7 +27,7 @@ Commercial VPNs ask you to trust them. With privpn you trust yourself:
 
 ## Prerequisites
 
-- **A VPS with a public IP.** Any Linux distro with a package manager (`apt` or `dnf`) — AlmaLinux, Ubuntu, Debian, Fedora, Rocky all work. ~2 EUR/month is plenty. Root or sudo access required.
+- **A VPS with a public IP.** Any Linux distro with a package manager (`apt` or `dnf`) — AlmaLinux, Ubuntu, Debian, Fedora, Rocky all work. ~2 EUR/month is plenty. Root or sudo access required. KVM-based VPSes are ideal; on VPSes where the WireGuard kernel module can't load, privpn falls back to userspace `wireguard-go` automatically.
 - **WireGuard on your client.** `wireguard-tools` on Linux (`sudo dnf install wireguard-tools` / `sudo apt install wireguard`), the WireGuard app on iOS/Android/macOS.
 - **SSH.** That's it. No `pass`, no `sshpass`, no Docker, no Python.
 
@@ -50,7 +50,7 @@ privpn — WireGuard VPN
 
   -- Setup (once) --
   1) VPS access             <- host, SSH key
-  2) Install WireGuard      <- install / peers / QR
+  2) Install WireGuard      <- install / add / remove / QR
 
   -- VPN --
   3) Connect
@@ -97,7 +97,36 @@ Keys and peer configs live on the VPS in `/etc/wireguard/`.
 | Doc | What |
 |-----|------|
 | [Customer Guide](customer-guide.md) | Full setup walkthrough, architecture, troubleshooting |
+| [PRD](PRD.md) | What privpn is, principles, roadmap (incl. planned Docker mode) |
 | [Changelog](CHANGELOG.md) | Version history |
+
+## Related projects
+
+privpn's niche is the **laptop-side orchestration over SSH** — it doesn't try to
+re-do work others already do well. If you want a pure server-side installer or a
+containerized WireGuard server, use these directly; privpn borrows ideas from
+both rather than duplicating them:
+
+- **[hwdsl2/wireguard-install](https://github.com/hwdsl2/wireguard-install)** — a
+  mature, multi-distro WireGuard **installer + client manager you run on the VPS
+  itself**. The reference for server-side robustness and peer add/remove.
+- **[hwdsl2/docker-wireguard](https://github.com/hwdsl2/docker-wireguard)** — a
+  **containerized** WireGuard server (docker-compose). The basis for privpn's
+  planned optional Docker mode, and the source of the userspace `wireguard-go`
+  fallback idea.
+
+### Docker VPN servers (other protocols)
+
+If WireGuard isn't the fit, the same author maintains drop-in containerized VPN
+servers for other protocols — handy if you want OpenVPN, IPsec, or a self-hosted
+Tailscale control plane instead:
+
+| Protocol | Project |
+|----------|---------|
+| WireGuard | [hwdsl2/docker-wireguard](https://github.com/hwdsl2/docker-wireguard) |
+| OpenVPN | [hwdsl2/docker-openvpn](https://github.com/hwdsl2/docker-openvpn) |
+| IPsec VPN | [hwdsl2/docker-ipsec-vpn-server](https://github.com/hwdsl2/docker-ipsec-vpn-server) |
+| Headscale | [hwdsl2/docker-headscale](https://github.com/hwdsl2/docker-headscale) |
 
 ## License
 

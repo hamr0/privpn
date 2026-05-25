@@ -148,16 +148,18 @@ step_wireguard() {
         echo ""
 
         echo -e "  ${BOLD}1)${NC} Add new peer"
-        echo -e "  ${BOLD}2)${NC} Show peer config / QR"
-        echo -e "  ${BOLD}3)${NC} Reinstall (regenerate all keys)"
+        echo -e "  ${BOLD}2)${NC} Remove a peer"
+        echo -e "  ${BOLD}3)${NC} Show peer config / QR"
+        echo -e "  ${BOLD}4)${NC} Reinstall (regenerate all keys)"
         echo -e "  ${BOLD}0)${NC} Cancel"
         echo ""
         read -p "  Choose: " wg_action
 
         case $wg_action in
             1) _wg_add_peer ;;
-            2) _wg_show_peer ;;
-            3) _wg_install ;;
+            2) _wg_remove_peer ;;
+            3) _wg_show_peer ;;
+            4) _wg_install ;;
             0|*) return ;;
         esac
         return
@@ -173,7 +175,8 @@ _wg_install() {
 
     # Detect package manager and install
     info "Installing packages (this may take a minute)..."
-    vps_ssh bash -s <<'DETECT'
+    local detect_out
+    detect_out=$(vps_ssh bash -s <<'DETECT'
 if command -v dnf &>/dev/null; then
     echo "  Installing repos..."
     dnf install -y epel-release elrepo-release 2>&1 | grep -E "^(Installing|Complete)" || true
@@ -185,12 +188,54 @@ elif command -v apt-get &>/dev/null; then
     apt-get update >/dev/null 2>&1
     echo "  Installing WireGuard..."
     apt-get install -y wireguard qrencode 2>&1 | grep -E "^(Setting up|is already)" || true
+    modprobe wireguard 2>/dev/null || true
 else
     echo "UNSUPPORTED_PKG_MANAGER"
     exit 1
 fi
+
+# Confirm a working backend: kernel module first, else userspace wireguard-go.
+# Some VPSes (OpenVZ, older kernels) can't load the module — wg-quick will
+# transparently use wireguard-go when the kernel module is absent.
+if ip link add dev wgprobe type wireguard 2>/dev/null; then
+    ip link del wgprobe 2>/dev/null || true
+    echo "BACKEND=kernel"
+else
+    echo "  Kernel module unavailable — installing userspace wireguard-go..."
+    if command -v dnf &>/dev/null; then
+        dnf install -y wireguard-go 2>&1 | grep -E "^(Installing|Complete|Already)" || true
+    elif command -v apt-get &>/dev/null; then
+        apt-get install -y wireguard-go 2>&1 | grep -E "^(Setting up|is already)" || true
+    fi
+    if command -v wireguard-go &>/dev/null; then
+        echo "BACKEND=userspace"
+    else
+        echo "BACKEND=none"
+    fi
+fi
 echo "INSTALL_OK"
 DETECT
+) || true
+
+    # Surface install progress lines, then act on the detected backend
+    echo "$detect_out" | grep -E '^  ' || true
+
+    if echo "$detect_out" | grep -q "UNSUPPORTED_PKG_MANAGER"; then
+        fail "Unsupported package manager on VPS (need dnf or apt)."
+        return 1
+    fi
+
+    local backend
+    backend=$(echo "$detect_out" | sed -n 's/^BACKEND=//p')
+    case "$backend" in
+        userspace) warn "Kernel module not available — using userspace wireguard-go." ;;
+        none)
+            fail "No working WireGuard backend on this VPS."
+            info "Neither the kernel module nor wireguard-go is available."
+            info "This is usually an OpenVZ VPS — try a KVM-based provider."
+            return 1
+            ;;
+    esac
 
     ok "WireGuard installed."
 
@@ -455,6 +500,78 @@ ADDPEER
     done
 
     ok "WireGuard reloaded."
+}
+
+_wg_remove_peer() {
+    echo ""
+    local conf_list
+    conf_list=$(vps_ssh "sudo find /etc/wireguard -name '*.conf' ! -name 'wg0.conf' -printf '%f\n' 2>/dev/null" 2>/dev/null)
+
+    if [[ -z "$conf_list" ]]; then
+        fail "No peer configs found on VPS."
+        return
+    fi
+
+    echo -e "  ${BOLD}Peers:${NC}"
+    local idx=1
+    declare -a conf_arr
+    while IFS= read -r f; do
+        local name="${f%.conf}"
+        echo -e "    ${BOLD}$idx)${NC} $name"
+        conf_arr[$idx]="$name"
+        idx=$((idx + 1))
+    done <<< "$conf_list"
+
+    echo ""
+    read -p "  Remove which peer? " peer_choice
+    local chosen="${conf_arr[$peer_choice]}"
+
+    if [[ -z "$chosen" ]]; then
+        fail "Invalid choice."
+        return
+    fi
+
+    read -p "  Remove '$chosen'? This revokes its access. [y/N] " -n 1 -r
+    echo ""
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        return
+    fi
+
+    # Drop the peer's [Peer] block from wg0.conf, delete its client config, reload
+    local output
+    output=$(vps_ssh bash -s -- "$chosen" <<'REMOVE'
+set -e
+PNAME="$1"
+WG_DIR="/etc/wireguard"
+
+# Paragraph-mode awk: drop the block containing the exact "# <name>" comment
+awk -v name="# $PNAME" 'BEGIN{RS="";FS="\n"} {
+    drop=0
+    for (i=1; i<=NF; i++) if ($i == name) drop=1
+    if (!drop) printf "%s\n\n", $0
+}' "$WG_DIR/wg0.conf" > "$WG_DIR/wg0.conf.tmp"
+mv "$WG_DIR/wg0.conf.tmp" "$WG_DIR/wg0.conf"
+chmod 600 "$WG_DIR/wg0.conf"
+
+rm -f "$WG_DIR/${PNAME}.conf"
+
+systemctl restart wg-quick@wg0
+echo "REMOVE_COMPLETE"
+REMOVE
+)
+
+    if ! echo "$output" | grep -q "REMOVE_COMPLETE"; then
+        fail "Failed to remove peer."
+        echo "$output"
+        return 1
+    fi
+
+    # If connect was pointed at this peer, forget it
+    if [[ -f "$CONFIG_DIR/peer_name" && "$(cat "$CONFIG_DIR/peer_name")" == "$chosen" ]]; then
+        rm -f "$CONFIG_DIR/peer_name"
+    fi
+
+    ok "Peer '$chosen' removed and WireGuard reloaded."
 }
 
 _wg_show_peer() {

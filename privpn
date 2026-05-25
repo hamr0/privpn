@@ -267,7 +267,7 @@ DETECT
     echo -e "  How many devices do you want to connect?"
     echo -e "  (phone, laptop, partner's phone, etc.)"
     read -p "  Number of peers [1]: " peer_count
-    peer_count="${peer_count:-1}"
+    [[ "$peer_count" =~ ^[1-9][0-9]*$ ]] || peer_count=1
 
     # Collect peer info locally first
     local peer_names=()
@@ -430,15 +430,14 @@ _wg_add_peer() {
     existing_peers=$(vps_ssh "sudo grep -c '^\[Peer\]' /etc/wireguard/wg0.conf 2>/dev/null" 2>/dev/null || echo "0")
 
     read -p "  How many new peers to add [1]: " peer_count
-    peer_count="${peer_count:-1}"
+    [[ "$peer_count" =~ ^[1-9][0-9]*$ ]] || peer_count=1
 
     local peer_names=()
     local peer_types=()
     for i in $(seq 1 "$peer_count"); do
         local peer_num=$((existing_peers + i))
-        local peer_ip="${VPN_SUBNET}.$((peer_num + 1))"
         echo ""
-        echo -e "  ${BOLD}-- New peer (IP: $peer_ip) --${NC}"
+        echo -e "  ${BOLD}-- New peer --${NC}"
         read -p "  Name: " pname
         pname="${pname:-peer${peer_num}}"
         while ! _valid_name "$pname"; do
@@ -457,20 +456,25 @@ _wg_add_peer() {
     # Add all peers in one SSH call
     local names_str="${peer_names[*]}"
     local output
-    output=$(vps_ssh bash -s -- "$VPS_HOST" "$WG_PORT" "$VPN_SUBNET" "$existing_peers" "$names_str" <<'ADDPEER'
+    output=$(vps_ssh bash -s -- "$VPS_HOST" "$WG_PORT" "$VPN_SUBNET" "$names_str" <<'ADDPEER'
 set -e
 ENDPOINT="$1"
 WG_PORT="$2"
 WG_SUBNET="$3"
-EXISTING="$4"
-shift 4
+shift 3
 PEER_NAMES=($@)
 
 WG_DIR="/etc/wireguard"
 SERVER_PUBLIC=$(grep "PrivateKey" "$WG_DIR/wg0.conf" | awk '{print $3}' | wg pubkey)
 
-IDX=$((EXISTING + 2))
+# Assign the lowest free host octet. Counting peers breaks after a middle peer
+# is removed — it would hand out an IP that's still in use.
+USED=$(grep -E '^AllowedIPs' "$WG_DIR/wg0.conf" | sed -E 's#.*\.([0-9]+)/32.*#\1#')
+next_free() { local n=2; while echo "$USED" | grep -qx "$n"; do n=$((n+1)); done; echo "$n"; }
+
 for PNAME in "${PEER_NAMES[@]}"; do
+    IDX=$(next_free)
+    USED=$(printf '%s\n%s' "$USED" "$IDX")   # reserve it for the next iteration
     PEER_PRIVATE=$(wg genkey)
     PEER_PUBLIC=$(echo "$PEER_PRIVATE" | wg pubkey)
     PEER_PSK=$(wg genpsk)
@@ -503,8 +507,6 @@ CLIENTEOF
     echo "PEER_CONF_${PNAME}"
     cat "$WG_DIR/${PNAME}.conf"
     echo "END_PEER_CONF_${PNAME}"
-
-    IDX=$((IDX + 1))
 done
 
 systemctl restart wg-quick@wg0
@@ -522,11 +524,12 @@ ADDPEER
         local idx=$((i - 1))
         local pname="${peer_names[$idx]}"
         local ptype="${peer_types[$idx]}"
-        local peer_num=$((existing_peers + i))
-        local peer_ip="${VPN_SUBNET}.$((peer_num + 1))"
 
         local peer_conf
         peer_conf=$(echo "$output" | sed -n "/^PEER_CONF_${pname}$/,/^END_PEER_CONF_${pname}$/p" | sed '1d;$d')
+
+        local peer_ip
+        peer_ip=$(echo "$peer_conf" | sed -n 's#^Address = \([0-9.]*\)/.*#\1#p')
 
         ok "Peer '${pname}' added (IP: ${peer_ip})"
         _wg_show_instructions "$pname" "$peer_conf" "$ptype"
@@ -739,7 +742,10 @@ vpn_connect() {
 
     # Fetch config from VPS — find the right peer config
     local saved_peer=""
-    [[ -f "$CONFIG_DIR/peer_name" ]] && saved_peer=$(cat "$CONFIG_DIR/peer_name")
+    if [[ -f "$CONFIG_DIR/peer_name" ]]; then
+        saved_peer=$(cat "$CONFIG_DIR/peer_name")
+        _valid_name "$saved_peer" || saved_peer=""   # ignore a tampered name
+    fi
 
     local peer_conf=""
     if [[ -n "$saved_peer" ]]; then
@@ -975,7 +981,7 @@ show_menu() {
     echo ""
     echo -e "  ${YELLOW}-- Setup (once) --${NC}"
     echo -e "  ${BOLD}1)${NC} VPS access             ${DIM}<- host, SSH key${NC}"
-    echo -e "  ${BOLD}2)${NC} Install WireGuard      ${DIM}<- install / peers / QR${NC}"
+    echo -e "  ${BOLD}2)${NC} Install WireGuard      ${DIM}<- install / add / remove / QR${NC}"
     echo ""
     echo -e "  ${DIM}-- VPN --${NC}"
     echo -e "  ${BOLD}3)${NC} Connect"

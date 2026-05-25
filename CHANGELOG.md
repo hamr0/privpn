@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-05-25 — Code-review fixes
+
+- Fix peer-IP collision: adding a peer after removing a non-last one reused an
+  in-use address (it counted peers instead of finding a free octet); now scans
+  AllowedIPs and assigns the lowest free IP
+- Guard non-numeric "number of peers" input (was aborting under `set -e`)
+- Validate the saved peer name before using it in a remote path (tampered file)
+- Menu hint now reads "install / add / remove / QR"; drop a dead loop counter
+
 ## 2026-05-25 — Security hardening (audit fixes)
 
 - SSH bootstrap no longer auto-trusts an unknown host key: the key-copy now

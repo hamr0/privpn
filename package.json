@@ -1,6 +1,6 @@
 {
   "name": "privpn",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "description": "WireGuard VPN through your own VPS. One script handles everything.",
   "repository": {

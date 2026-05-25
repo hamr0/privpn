@@ -102,31 +102,14 @@ Keys and peer configs live on the VPS in `/etc/wireguard/`.
 
 ## Related projects
 
-privpn's niche is the **laptop-side orchestration over SSH** — it doesn't try to
-re-do work others already do well. If you want a pure server-side installer or a
-containerized WireGuard server, use these directly; privpn borrows ideas from
-both rather than duplicating them:
+privpn sets up a WireGuard VPN on your VPS from your laptop. If you want other
+options, check these:
 
-- **[hwdsl2/wireguard-install](https://github.com/hwdsl2/wireguard-install)** — a
-  mature, multi-distro WireGuard **installer + client manager you run on the VPS
-  itself**. The reference for server-side robustness and peer add/remove.
-- **[hwdsl2/docker-wireguard](https://github.com/hwdsl2/docker-wireguard)** — a
-  **containerized** WireGuard server (docker-compose). The basis for privpn's
-  planned optional Docker mode, and the source of the userspace `wireguard-go`
-  fallback idea.
-
-### Docker VPN servers (other protocols)
-
-If privpn isn't the right fit, these other repos tackle the same goal — a
-self-hosted, containerized VPN server — for different protocols. Reach for one of
-them if you'd rather run OpenVPN, IPsec, or a self-hosted Tailscale control plane:
-
-| Protocol | Project |
-|----------|---------|
-| WireGuard | [hwdsl2/docker-wireguard](https://github.com/hwdsl2/docker-wireguard) |
-| OpenVPN | [hwdsl2/docker-openvpn](https://github.com/hwdsl2/docker-openvpn) |
-| IPsec VPN | [hwdsl2/docker-ipsec-vpn-server](https://github.com/hwdsl2/docker-ipsec-vpn-server) |
-| Headscale | [hwdsl2/docker-headscale](https://github.com/hwdsl2/docker-headscale) |
+- [WireGuard installer](https://github.com/hwdsl2/wireguard-install) — run on the VPS itself
+- [WireGuard (Docker)](https://github.com/hwdsl2/docker-wireguard)
+- [OpenVPN (Docker)](https://github.com/hwdsl2/docker-openvpn)
+- [IPsec VPN (Docker)](https://github.com/hwdsl2/docker-ipsec-vpn-server)
+- [Headscale (Docker)](https://github.com/hwdsl2/docker-headscale)
 
 ## License
 

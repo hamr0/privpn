@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-05-25 — README: trim Related projects
+
+- Cut the prose and table down to one line plus clean named links
+- Reframed the other repos as alternatives (not "same author")
+
 ## 2026-05-25 — v0.3.0: userspace fallback, remove-peer, Docker on the roadmap
 
 - Backend detection on install: probes the WireGuard kernel module, falls back to

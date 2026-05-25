@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-05-25 — Security hardening (audit fixes)
+
+- SSH bootstrap no longer auto-trusts an unknown host key: the key-copy now
+  shows the fingerprint and asks before the VPS password is sent, with a prompt
+  to verify it against the provider console (first-connect MITM)
+- Local WireGuard config is created 0600 before writing, closing a brief window
+  where the private key was world-readable (tee → chmod race)
+- Validate VPS host/user and peer names (`[A-Za-z0-9._:-]`): blocks shell
+  metacharacters reaching the sourced config and path traversal via peer names
+- `disable-password` now sets `PasswordAuthentication no` whether the directive
+  is present, commented, or absent, neutralizes `sshd_config.d` drop-ins,
+  validates with `sshd -t`, and fails loudly instead of reporting false success
+
 ## 2026-05-25 — README: trim Related projects
 
 - Cut the prose and table down to one line plus clean named links

@@ -48,6 +48,14 @@ EOF
     chmod 600 "$CONFIG_FILE"
 }
 
+# ── Input validation ─────────────────────────────────
+# These values become filenames, ssh args, and lines in a config that is later
+# sourced — so reject anything but a safe charset to keep them from being
+# interpreted as shell.
+_valid_name() { [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]; }   # peer / interface names
+_valid_host() { [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]; } # IPv4/IPv6/hostname
+_valid_user() { [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]]; }  # ssh username
+
 vps_ssh() {
     load_config
     if [[ -z "$VPS_HOST" || -z "$VPS_USER" ]]; then
@@ -85,6 +93,15 @@ step_vps_access() {
     read -p "  VPS user [$default_user]: " input_user
     VPS_USER="${input_user:-$default_user}"
 
+    if ! _valid_host "$VPS_HOST"; then
+        fail "Invalid host '$VPS_HOST' — letters, digits and . : - _ only."
+        return 1
+    fi
+    if ! _valid_user "$VPS_USER"; then
+        fail "Invalid user '$VPS_USER'."
+        return 1
+    fi
+
     echo ""
 
     # Check for existing SSH key
@@ -95,8 +112,9 @@ step_vps_access() {
         echo ""
     fi
 
-    # Test if key auth already works
-    if ssh -o PasswordAuthentication=no -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$VPS_USER@$VPS_HOST" "echo ok" &>/dev/null; then
+    # Test if key auth already works (default host-key policy: don't silently
+    # persist an unknown key before we've had a chance to verify it)
+    if ssh -o PasswordAuthentication=no -o ConnectTimeout=10 "$VPS_USER@$VPS_HOST" "echo ok" &>/dev/null; then
         ok "SSH key already works for $VPS_USER@$VPS_HOST"
         save_config
         ok "Config saved: $CONFIG_FILE"
@@ -105,9 +123,14 @@ step_vps_access() {
 
     # Copy SSH key (will prompt for password)
     info "Copying SSH key to $VPS_USER@$VPS_HOST..."
+    warn "First connection: you'll be shown the VPS host-key fingerprint."
+    warn "Verify it against your provider's console before typing 'yes' —"
+    warn "your VPS password is sent over this connection."
     info "Enter your VPS password when prompted (last time you'll need it)."
     echo ""
-    ssh-copy-id -o StrictHostKeyChecking=accept-new "$VPS_USER@$VPS_HOST"
+    # Default policy ('ask') prompts with the fingerprint for an unknown host,
+    # so the password isn't sent to an unverified server.
+    ssh-copy-id "$VPS_USER@$VPS_HOST"
 
     # Verify it works
     echo ""
@@ -254,6 +277,11 @@ DETECT
         echo -e "  ${BOLD}-- Peer $i of $peer_count --${NC}"
         read -p "  Name for this device (e.g. phone, laptop): " pname
         pname="${pname:-peer$i}"
+        while ! _valid_name "$pname"; do
+            warn "Letters, digits, dashes and underscores only."
+            read -p "  Name: " pname
+            pname="${pname:-peer$i}"
+        done
         echo ""
         echo -e "  Device type for '${BOLD}$pname${NC}'?"
         echo -e "  ${BOLD}1)${NC} Phone (iPhone/Android)"
@@ -413,6 +441,11 @@ _wg_add_peer() {
         echo -e "  ${BOLD}-- New peer (IP: $peer_ip) --${NC}"
         read -p "  Name: " pname
         pname="${pname:-peer${peer_num}}"
+        while ! _valid_name "$pname"; do
+            warn "Letters, digits, dashes and underscores only."
+            read -p "  Name: " pname
+            pname="${pname:-peer${peer_num}}"
+        done
         echo ""
         echo -e "  Device type for '${BOLD}$pname${NC}'?"
         echo -e "  ${BOLD}1)${NC} Phone   ${BOLD}2)${NC} Linux   ${BOLD}3)${NC} Mac"
@@ -749,10 +782,12 @@ vpn_connect() {
         echo "$saved_peer" > "$CONFIG_DIR/peer_name"
     fi
 
-    # Save config locally and connect
+    # Save config locally and connect. Create the file 0600 *first* so the
+    # private key is never briefly world-readable (tee preserves perms on an
+    # existing file).
     sudo mkdir -p /etc/wireguard
+    sudo install -m 600 /dev/null "$WG_CONF"
     echo "$peer_conf" | sudo tee "$WG_CONF" > /dev/null
-    sudo chmod 600 "$WG_CONF"
 
     sudo sysctl -qw net.ipv6.conf.all.disable_ipv6=0
     sudo wg-quick up "$WG_IFACE"
@@ -811,7 +846,35 @@ step_disable_password() {
         return 1
     fi
 
-    vps_ssh "sudo sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && sudo systemctl restart sshd"
+    local out
+    out=$(vps_ssh "sudo bash -s" <<'HARDEN'
+set -e
+CFG=/etc/ssh/sshd_config
+# Set the directive in place if it exists (commented or not), else append it —
+# a bare sed silently does nothing when the line is absent, leaving login open.
+if grep -qiE '^[[:space:]]*#?[[:space:]]*PasswordAuthentication' "$CFG"; then
+    sed -i -E 's/^[[:space:]]*#?[[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/I' "$CFG"
+else
+    printf '\nPasswordAuthentication no\n' >> "$CFG"
+fi
+# Distros ship drop-ins that can re-enable it after the main file is read.
+if [ -d /etc/ssh/sshd_config.d ]; then
+    grep -rilE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' /etc/ssh/sshd_config.d 2>/dev/null \
+        | while read -r f; do
+            sed -i -E 's/^[[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/I' "$f"
+        done
+fi
+sshd -t                                            # validate before applying
+systemctl restart sshd 2>/dev/null || systemctl restart ssh
+echo "HARDEN_OK"
+HARDEN
+) || true
+
+    if ! echo "$out" | grep -q "HARDEN_OK"; then
+        fail "Could not disable password login (config left unchanged)."
+        echo "$out"
+        return 1
+    fi
     ok "Password login disabled. Key-only from now on."
 }
 

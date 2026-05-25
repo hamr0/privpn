@@ -117,9 +117,9 @@ both rather than duplicating them:
 
 ### Docker VPN servers (other protocols)
 
-If WireGuard isn't the fit, the same author maintains drop-in containerized VPN
-servers for other protocols — handy if you want OpenVPN, IPsec, or a self-hosted
-Tailscale control plane instead:
+If privpn isn't the right fit, these other repos tackle the same goal — a
+self-hosted, containerized VPN server — for different protocols. Reach for one of
+them if you'd rather run OpenVPN, IPsec, or a self-hosted Tailscale control plane:
 
 | Protocol | Project |
 |----------|---------|

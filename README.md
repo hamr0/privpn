@@ -63,7 +63,7 @@ privpn — WireGuard VPN
   0) Exit
 ```
 
-Also works as a CLI: `privpn connect`, `privpn disconnect`, `privpn status`, `privpn setup`, `privpn wg`.
+Also works as a CLI: `privpn connect`, `privpn disconnect`, `privpn status`, `privpn setup`, `privpn wg`, `privpn disable-password`, `privpn save-to-pass`.
 
 ## How it works
 
